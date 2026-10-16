@@ -23,14 +23,22 @@ const clip = (text) => (text.length > MAX_RESULT_CHARS
     : text)
 const lineCount = (text) => (text ? text.split('\n').length : 0)
 
+// Swaps in unsaved editor text, so the AI sees files as the user sees them, saved or not
+const withDrafts = (nodes, drafts) => nodes.map((node) => {
+    if (isFolder(node)) return { ...node, children: withDrafts(node.children || [], drafts) }
+    const draft = drafts[node._id]
+    return draft === undefined || node.skipped ? node : { ...node, content: draft, size: draft.length }
+})
+
 // onChange({ path, fileId, name, before, after }) reports every file the AI changes, for
 // review and undo. before is null for a new file, after is null for a deleted one.
-export const createToolRunner = ({ projectId, onChange }) => {
+// getDrafts() returns unsaved editor content by file id.
+export const createToolRunner = ({ projectId, onChange, getDrafts }) => {
     let tree = null
     const report = (change) => onChange?.(change)
 
     const load = async () => {
-        tree ??= (await getTree(projectId)) || []
+        tree ??= withDrafts((await getTree(projectId)) || [], getDrafts?.() || {})
         return tree
     }
     // Every change reloads the tree before the next lookup, so paths stay current

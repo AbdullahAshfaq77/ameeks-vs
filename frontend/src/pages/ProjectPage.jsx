@@ -40,6 +40,9 @@ function ProjectPage() {
   
   // Unsaved editor content by file id, shared so the preview shows edits before they are saved
   const [drafts, setDrafts] = useState({})
+  // Read by AmeekAi's tools mid-run, so they always see the latest unsaved text
+  const draftsRef = useRef(drafts)
+  useEffect(() => { draftsRef.current = drafts }, [drafts])
   const { id } = useParams()
   const dispatch = useDispatch()
   const currentProject = useSelector((state) => state.project.currentProject)
@@ -178,6 +181,14 @@ function ProjectPage() {
         : { ...change, state: 'pending' }
       const rest = prev.filter(c => c.path !== change.path)
       return merged.before === merged.after ? rest : [...rest, merged]
+    })
+    // The AI worked from the unsaved text and saved its result, so that draft is now on disk;
+    // dropping it lets the open tab show the AI's version
+    setDrafts(d => {
+      if (!(change.fileId in d)) return d
+      const rest = { ...d }
+      delete rest[change.fileId]
+      return rest
     })
     // Follow along: the file the AI just changed opens in the editor, showing the diff
     if (change.after !== null) openFile({ _id: change.fileId, name: change.name, type: 'file', content: change.after })
@@ -379,6 +390,7 @@ function ProjectPage() {
               }}
               onFilesChanged={loadTree}
               onAiChange={recordAiChange}
+              getDrafts={() => draftsRef.current}
               aiChanges={aiChanges}
               onOpenChange={openChangedFile}
               onKeepChange={keepChange}

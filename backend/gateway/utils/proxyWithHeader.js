@@ -1,9 +1,9 @@
 import proxy from "express-http-proxy"
 
-export const proxyWithHeader = (serviceUrl) => {
+export const proxyWithHeader = (serviceUrl, limit = "5mb") => {
          return proxy(serviceUrl ,{
              // The AI service receives whole files back from the browser as tool results
-             limit:"5mb",
+             limit,
              proxyReqOptDecorator:(proxyReqOpts,req)=>{
                  const userId = req.user?._id
                  if(!userId){

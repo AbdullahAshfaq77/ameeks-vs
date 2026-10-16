@@ -1,8 +1,8 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { AlertCircle, ArrowUp, Bug, Check, ChevronDown, FileText, FlaskConical, History, MessageSquarePlus, Paperclip, Redo2, RotateCcw, Sparkles, Square, Trash2, Undo2, X } from 'lucide-react'
+import { AlertCircle, ArrowUp, Bug, Check, ChevronDown, FileText, FlaskConical, History, Image as ImageIcon, MessageSquarePlus, Paperclip, Redo2, RotateCcw, Sparkles, Square, Trash2, Undo2, X } from 'lucide-react'
 import Markdown from './Markdown'
-import { runAmeekAi } from '../features/ai'
+import { getAmeekAiImage, prepareAmeekAiImage, runAmeekAi, uploadAmeekAiImage } from '../features/ai'
 import { CHANGING_TOOLS, createToolRunner, describeToolCall } from '../features/aiTools'
 import { countLineChanges } from '../utils/lineDiff'
 
@@ -58,7 +58,9 @@ const loadChats = (projectId) => {
     const chat = createChat(legacy)
     return { activeId: chat.id, chats: [chat] }
 }
-const formatSize = (bytes) => (bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`)
+const formatSize = (bytes) => bytes < 1024 * 1024
+    ? `${bytes < 1024 ? bytes : Math.round(bytes / 1024)} ${bytes < 1024 ? 'B' : 'KB'}`
+    : `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 
 // A floating mascot for the empty state — blinks and drifts, nothing else
 function RobotMark() {
@@ -159,7 +161,9 @@ function TypingDots() {
 function AttachmentChip({ file, onRemove }) {
     return (
         <span className='flex max-w-full items-center gap-1 rounded-md border border-white/[0.08] bg-white/[0.04] py-0.5 pl-1.5 pr-1 text-[10.5px] text-zinc-400'>
-            <FileText size={10} className='shrink-0 text-zinc-500' />
+            {file.kind === 'image'
+                ? <ImageIcon size={10} className='shrink-0 text-zinc-500' />
+                : <FileText size={10} className='shrink-0 text-zinc-500' />}
             <span className='truncate'>{file.name}</span>
             <span className='shrink-0 text-zinc-600'>{formatSize(file.size)}</span>
             {onRemove && (
@@ -173,6 +177,47 @@ function AttachmentChip({ file, onRemove }) {
                 </button>
             )}
         </span>
+    )
+}
+
+function StoredImage({ image, onClick, className = '', fit = 'cover' }) {
+    const [source, setSource] = useState('')
+    const [failed, setFailed] = useState(false)
+
+    useEffect(() => {
+        let active = true
+        let objectUrl
+        getAmeekAiImage(image.imageId)
+            .then((blob) => {
+                objectUrl = URL.createObjectURL(blob)
+                if (active) setSource(objectUrl)
+                else URL.revokeObjectURL(objectUrl)
+            })
+            .catch(() => {
+                if (active) setFailed(true)
+            })
+        return () => {
+            active = false
+            if (objectUrl) URL.revokeObjectURL(objectUrl)
+        }
+    }, [image.imageId])
+
+    if (failed) {
+        return <div className={`flex items-center justify-center rounded-md border border-white/[0.08] bg-white/[0.03] text-[10px] text-zinc-500 ${className}`}>Image unavailable</div>
+    }
+
+    return (
+        <button
+            type='button'
+            onClick={() => onClick?.(image)}
+            disabled={!source || !onClick}
+            aria-label={`View ${image.name}`}
+            className={`overflow-hidden rounded-md bg-white/[0.04] disabled:cursor-default ${className}`}
+        >
+            {source
+                ? <img src={source} alt={image.name} className={`size-full object-${fit}`} />
+                : <span className='flex size-full min-h-12 items-center justify-center text-[10px] text-zinc-600'>Loading image…</span>}
+        </button>
     )
 }
 
@@ -205,7 +250,7 @@ function Steps({ steps }) {
     )
 }
 
-function Message({ message, onRetry }) {
+function Message({ message, onRetry, onImageClick }) {
     if (message.role === 'user') {
         return (
             <motion.div
@@ -217,10 +262,22 @@ function Message({ message, onRetry }) {
                 <div className='max-w-[88%] rounded-2xl rounded-br-md bg-gradient-to-br from-sky-500 to-violet-500 px-3 py-2 text-[13px] leading-relaxed text-white shadow-lg shadow-sky-500/10 [overflow-wrap:anywhere]'>
                     {message.content}
                 </div>
-                {message.attachments?.length > 0 && (
+                {message.attachments?.some((file) => file.kind === 'image' && file.imageId) && (
                     <div className='flex max-w-[88%] flex-wrap justify-end gap-1'>
-                        {message.attachments.map((file) => (
-                            <AttachmentChip key={file.name} file={file} />
+                        {message.attachments.filter((file) => file.kind === 'image' && file.imageId).map((image) => (
+                            <StoredImage
+                                key={image.imageId}
+                                image={image}
+                                onClick={onImageClick}
+                                className='size-16 border border-white/[0.08]'
+                            />
+                        ))}
+                    </div>
+                )}
+                {message.attachments?.filter((file) => file.kind !== 'image').length > 0 && (
+                    <div className='flex max-w-[88%] flex-wrap justify-end gap-1'>
+                        {message.attachments.filter((file) => file.kind !== 'image').map((file, index) => (
+                            <AttachmentChip key={`${file.name}-${index}`} file={file} />
                         ))}
                     </div>
                 )}
@@ -373,6 +430,7 @@ function AiChat({
     context,
     onFilesChanged,
     onAiChange,
+    getDrafts,
     aiChanges = [],
     onOpenChange,
     onKeepChange,
@@ -384,6 +442,8 @@ function AiChat({
 }) {
     const [store, setStore] = useState(() => loadChats(projectId))
     const [showHistory, setShowHistory] = useState(false)
+    const [showImages, setShowImages] = useState(false)
+    const [previewImage, setPreviewImage] = useState(null)
     const activeChat = store.chats.find((chat) => chat.id === store.activeId) || store.chats[0]
     const messages = activeChat.messages
     // Updates the open chat's messages; takes a new list or an updater, like a state setter
@@ -395,15 +455,20 @@ function AiChat({
     }))
     const [input, setInput] = useState('')
     const [attachments, setAttachments] = useState([])
+    const [attachmentError, setAttachmentError] = useState('')
     const [sending, setSending] = useState(false)
 
     const scrollRef = useRef(null)
     const textareaRef = useRef(null)
     const fileInputRef = useRef(null)
     const abortRef = useRef(null)
+    const attachmentUrlsRef = useRef(new Set())
 
     // Stop a reply that is still running when the panel closes
-    useEffect(() => () => abortRef.current?.abort(), [])
+    useEffect(() => () => {
+        abortRef.current?.abort()
+        attachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+    }, [])
 
     useEffect(() => {
         try {
@@ -434,7 +499,37 @@ function AiChat({
         const content = text.trim()
         if ((!content && !files.length) || sending) return
 
-        const userMessage = { id: newId(), role: 'user', content, attachments: files.map(({ name, size }) => ({ name, size })) }
+        setSending(true)
+        setAttachmentError('')
+        const controller = new AbortController()
+        abortRef.current = controller
+        const readyFiles = []
+        try {
+            for (const file of files) {
+                if (file.kind !== 'image' || file.imageId) {
+                    readyFiles.push(file)
+                    continue
+                }
+                const indexed = await uploadAmeekAiImage({ projectId, file: file.file, name: file.name, signal: controller.signal })
+                const ready = { ...file, ...indexed }
+                readyFiles.push(ready)
+                setAttachments((previous) => previous.map((item) => item.id === file.id ? ready : item))
+            }
+        } catch (error) {
+            if (abortRef.current === controller) abortRef.current = null
+            setSending(false)
+            if (!controller.signal.aborted) {
+                setAttachmentError(error.response?.data?.message || error.message || 'AmeekAi could not process an image. Try again.')
+            }
+            return
+        }
+
+        const userMessage = {
+            id: newId(),
+            role: 'user',
+            content,
+            attachments: readyFiles.map(({ name, size, kind, imageId, mimeType }) => ({ name, size, kind, imageId, mimeType })),
+        }
         const pendingId = newId()
         // Earlier turns only; failed replies are left out so the model does not repeat them
         const history = messages
@@ -443,12 +538,15 @@ function AiChat({
 
         setMessages([...messages, userMessage, { id: pendingId, role: 'ai', content: '', pending: true, steps: [] }])
         setInput('')
+        readyFiles.forEach((file) => {
+            if (file.previewUrl) {
+                URL.revokeObjectURL(file.previewUrl)
+                attachmentUrlsRef.current.delete(file.previewUrl)
+            }
+        })
         setAttachments([])
-        setSending(true)
 
-        const controller = new AbortController()
-        abortRef.current = controller
-        const runner = createToolRunner({ projectId, onChange: onAiChange })
+        const runner = createToolRunner({ projectId, onChange: onAiChange, getDrafts })
         const updatePending = (update) =>
             setMessages((prev) => prev.map((message) => (message.id === pendingId ? update(message) : message)))
 
@@ -456,7 +554,7 @@ function AiChat({
             projectId,
             message: content,
             history,
-            attachments: files,
+            attachments: readyFiles,
             context,
             signal: controller.signal,
             runTool: runner.run,
@@ -493,7 +591,8 @@ function AiChat({
         if (!lastUser) return
         // Drop the failed exchange, then replay it
         setMessages((prev) => prev.slice(0, prev.findIndex((message) => message.id === lastUser.id)))
-        setTimeout(() => send(lastUser.content, []), 0)
+        const images = (lastUser.attachments || []).filter((file) => file.kind === 'image' && file.imageId)
+        setTimeout(() => send(lastUser.content, images), 0)
     }
 
     const onKeyDown = (event) => {
@@ -503,20 +602,85 @@ function AiChat({
         }
     }
 
-    const attach = async (event) => {
-        const picked = Array.from(event.target.files || [])
-        event.target.value = ''
+    const addAttachments = async (picked) => {
+        if (!picked.length) return
+        setAttachmentError('')
+        const pickedImages = picked.filter((file) => file.type.startsWith('image/'))
+        const images = []
+        const imageErrors = []
+        for (const [index, file] of pickedImages.entries()) {
+            try {
+                const namedFile = file.name
+                    ? file
+                    : new File([file], `pasted-image-${Date.now()}-${index + 1}.png`, { type: file.type || 'image/png' })
+                const prepared = await prepareAmeekAiImage(namedFile)
+                const previewUrl = URL.createObjectURL(prepared)
+                attachmentUrlsRef.current.add(previewUrl)
+                images.push({
+                    id: newId(),
+                    kind: 'image',
+                    file: prepared,
+                    name: namedFile.name,
+                    size: prepared.size,
+                    mimeType: prepared.type,
+                    previewUrl,
+                })
+            } catch (error) {
+                imageErrors.push(`${file.name}: ${error.message}`)
+            }
+        }
 
-        const room = MAX_ATTACHMENTS - attachments.length
-        const files = await Promise.all(
-            picked.slice(0, Math.max(room, 0)).map(async (file) => ({
+        const pickedText = picked.filter((file) => !file.type.startsWith('image/'))
+        const existingTextCount = attachments.filter((file) => file.kind !== 'image').length
+        const room = Math.max(MAX_ATTACHMENTS - existingTextCount, 0)
+        const textFiles = pickedText.slice(0, room)
+        let files
+        try {
+            files = await Promise.all(textFiles.map(async (file) => ({
+                id: newId(),
+                kind: 'text',
                 name: file.name,
                 size: file.size,
-                // Oversized files are still listed, but only the head is sent along
-                content: await file.slice(0, MAX_ATTACHMENT_BYTES).text().catch(() => ''),
-            }))
-        )
-        setAttachments((prev) => [...prev, ...files.filter((file) => !prev.some((existing) => existing.name === file.name))])
+                content: await file.slice(0, MAX_ATTACHMENT_BYTES).text(),
+            })))
+        } catch {
+            images.forEach((file) => {
+                URL.revokeObjectURL(file.previewUrl)
+                attachmentUrlsRef.current.delete(file.previewUrl)
+            })
+            setAttachmentError(`A selected text file could not be read.${imageErrors.length ? ` ${imageErrors.join(' ')}` : ''}`)
+            return
+        }
+        setAttachments((previous) => [...previous, ...images, ...files])
+
+        const errors = [
+            ...imageErrors,
+            pickedText.length > textFiles.length && `You can attach up to ${MAX_ATTACHMENTS} non-image files at a time.`,
+        ].filter(Boolean)
+        if (errors.length) {
+            setAttachmentError(errors.slice(0, 4).join(' '))
+        }
+    }
+
+    const attach = (event) => {
+        const picked = Array.from(event.target.files || [])
+        event.target.value = ''
+        void addAttachments(picked)
+    }
+
+    const onPaste = (event) => {
+        const items = Array.from(event.clipboardData?.items || [])
+        const pastedImages = items
+            .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+            .map((item) => item.getAsFile())
+            .filter(Boolean)
+        const images = pastedImages.length
+            ? pastedImages
+            : Array.from(event.clipboardData?.files || []).filter((file) => file.type.startsWith('image/'))
+
+        if (!images.length) return
+        event.preventDefault()
+        void addAttachments(images)
     }
 
     const usePrompt = (prompt) => {
@@ -527,7 +691,16 @@ function AiChat({
     // Starts a fresh conversation; an empty open chat is reused instead of piling up
     const newChat = () => {
         setShowHistory(false)
+        setShowImages(false)
+        setPreviewImage(null)
         setInput('')
+        setAttachmentError('')
+        attachments.forEach((file) => {
+            if (file.previewUrl) {
+                URL.revokeObjectURL(file.previewUrl)
+                attachmentUrlsRef.current.delete(file.previewUrl)
+            }
+        })
         setAttachments([])
         if (messages.length) {
             const chat = createChat()
@@ -539,6 +712,8 @@ function AiChat({
     const openChat = (chatId) => {
         setStore((current) => ({ ...current, activeId: chatId }))
         setShowHistory(false)
+        setShowImages(false)
+        setPreviewImage(null)
     }
 
     const deleteChat = (chatId) => {
@@ -553,6 +728,11 @@ function AiChat({
     }
 
     const pastChats = [...store.chats].filter((chat) => chat.messages.length).sort((a, b) => b.updatedAt - a.updatedAt)
+    const chatImages = [...new Map(
+        messages.flatMap((message) => message.role === 'user' ? message.attachments || [] : [])
+            .filter((file) => file.kind === 'image' && file.imageId)
+            .map((image) => [image.imageId, image])
+    ).values()]
 
     const canSend = (input.trim().length > 0 || attachments.length > 0) && !sending
     const stop = () => abortRef.current?.abort()
@@ -597,7 +777,29 @@ function AiChat({
                     </button>
                     <button
                         type='button'
-                        onClick={() => setShowHistory(!showHistory)}
+                        onClick={() => {
+                            setShowHistory(false)
+                            setShowImages(!showImages)
+                        }}
+                        disabled={sending || chatImages.length === 0}
+                        title='Images in this chat'
+                        aria-label={`Images in this chat (${chatImages.length})`}
+                        className={`relative rounded-md p-1 transition-colors hover:bg-white/[0.06] hover:text-zinc-200 disabled:pointer-events-none disabled:opacity-30
+                            ${showImages ? 'bg-white/[0.06] text-zinc-200' : 'text-zinc-500'}`}
+                    >
+                        <ImageIcon size={14} />
+                        {chatImages.length > 0 && (
+                            <span className='absolute -right-1 -top-1 flex min-w-3.5 items-center justify-center rounded-full bg-sky-500 px-0.5 text-[8px] leading-3 text-white'>
+                                {chatImages.length}
+                            </span>
+                        )}
+                    </button>
+                    <button
+                        type='button'
+                        onClick={() => {
+                            setShowImages(false)
+                            setShowHistory(!showHistory)
+                        }}
                         disabled={sending || pastChats.length === 0}
                         title='Chat History'
                         aria-label='Chat History'
@@ -655,6 +857,75 @@ function AiChat({
                 )}
             </AnimatePresence>
 
+            <AnimatePresence>
+                {showImages && (
+                    <motion.section
+                        initial={{ opacity: 0, y: -6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -6 }}
+                        transition={{ duration: 0.15 }}
+                        aria-label='Images sent in this chat'
+                        className='absolute inset-x-0 bottom-0 top-10 z-20 flex flex-col border-t border-white/[0.06] bg-[#131316] shadow-2xl shadow-black/60'
+                    >
+                        <div className='flex h-9 shrink-0 items-center justify-between border-b border-white/[0.06] px-3'>
+                            <span className='text-[11px] font-semibold text-zinc-300'>Images · {chatImages.length}</span>
+                            <button
+                                type='button'
+                                onClick={() => setShowImages(false)}
+                                title='Close images'
+                                aria-label='Close images'
+                                className='rounded p-1 text-zinc-500 transition-colors hover:bg-white/[0.06] hover:text-zinc-200'
+                            >
+                                <X size={12} />
+                            </button>
+                        </div>
+                        <div className='grid grid-cols-3 content-start gap-2 overflow-y-auto p-2'>
+                            {chatImages.map((image) => (
+                                <div key={image.imageId} className='min-w-0'>
+                                    <StoredImage
+                                        image={image}
+                                        onClick={setPreviewImage}
+                                        className='aspect-square w-full border border-white/[0.08]'
+                                    />
+                                    <span className='mt-1 block truncate text-[9px] text-zinc-500' title={image.name}>{image.name}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </motion.section>
+                )}
+            </AnimatePresence>
+
+            <AnimatePresence>
+                {previewImage && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        role='dialog'
+                        aria-modal='true'
+                        aria-label={previewImage.name}
+                        className='absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 bg-black/90 p-4'
+                    >
+                        <button
+                            type='button'
+                            onClick={() => setPreviewImage(null)}
+                            title='Close image preview'
+                            aria-label='Close image preview'
+                            className='absolute right-2 top-2 rounded-md bg-white/[0.08] p-1.5 text-zinc-300 hover:bg-white/[0.15]'
+                        >
+                            <X size={14} />
+                        </button>
+                        <StoredImage
+                            key={previewImage.imageId}
+                            image={previewImage}
+                            className='h-[70vh] max-h-[70vh] w-full max-w-full bg-transparent'
+                            fit='contain'
+                        />
+                        <span className='max-w-full truncate text-[11px] text-zinc-400'>{previewImage.name}</span>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
             <div
                 ref={scrollRef}
                 className='w-72 flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent
@@ -667,13 +938,19 @@ function AiChat({
                 ) : (
                     <div className='flex flex-col gap-3 px-3 py-3'>
                         {messages.map((message) => (
-                            <Message key={message.id} message={message} onRetry={retry} />
+                            <Message key={message.id} message={message} onRetry={retry} onImageClick={setPreviewImage} />
                         ))}
                     </div>
                 )}
             </div>
 
             <div className='w-72 shrink-0 border-t border-white/[0.06] bg-[#111113]/95 px-2.5 py-2'>
+                {attachmentError && (
+                    <p role='alert' className='mb-1.5 flex items-start gap-1 text-[10.5px] leading-4 text-rose-300'>
+                        <AlertCircle size={12} className='mt-0.5 shrink-0' />
+                        {attachmentError}
+                    </p>
+                )}
                 {aiChanges.length > 0 && (
                     <ChangesPanel
                         changes={aiChanges}
@@ -696,9 +973,17 @@ function AiChat({
                         >
                             {attachments.map((file, index) => (
                                 <AttachmentChip
-                                    key={file.name}
+                                    key={file.id}
                                     file={file}
-                                    onRemove={() => setAttachments((prev) => prev.filter((_, i) => i !== index))}
+                                    onRemove={() => {
+                                        const removed = attachments[index]
+                                        if (removed.previewUrl) {
+                                            URL.revokeObjectURL(removed.previewUrl)
+                                            attachmentUrlsRef.current.delete(removed.previewUrl)
+                                        }
+                                        setAttachments((prev) => prev.filter((_, i) => i !== index))
+                                        setAttachmentError('')
+                                    }}
                                 />
                             ))}
                         </motion.div>
@@ -712,7 +997,8 @@ function AiChat({
                         value={input}
                         onChange={(event) => setInput(event.target.value)}
                         onKeyDown={onKeyDown}
-                        placeholder='Ask AmeekAi anything...'
+                        onPaste={onPaste}
+                        placeholder='Ask AmeekAi anything... (paste an image)'
                         className='block w-full resize-none bg-transparent px-2.5 py-2 text-[13px] leading-5 text-zinc-200 outline-none
                         placeholder:text-zinc-600 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent
                         [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/[0.08]'
@@ -721,12 +1007,12 @@ function AiChat({
 
                     <div className='flex items-center justify-between gap-2 px-1.5 pb-1.5'>
                         <div className='flex items-center gap-1'>
-                            <input ref={fileInputRef} type='file' multiple hidden onChange={attach} />
+                            <input ref={fileInputRef} type='file' accept='image/*,.txt,.md,.js,.jsx,.ts,.tsx,.json,.html,.css,.py,.java,.go,.rs,.c,.cpp,.h,.sql' multiple hidden onChange={attach} />
                             <button
                                 type='button'
                                 onClick={() => fileInputRef.current?.click()}
-                                disabled={attachments.length >= MAX_ATTACHMENTS}
-                                title={attachments.length >= MAX_ATTACHMENTS ? `Up to ${MAX_ATTACHMENTS} files` : 'Attach files'}
+                                disabled={sending}
+                                title='Attach images or text files'
                                 aria-label='Attach files'
                                 className='rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-white/[0.06] hover:text-zinc-200 disabled:pointer-events-none disabled:opacity-30'
                             >

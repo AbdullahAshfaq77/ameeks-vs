@@ -1,7 +1,9 @@
 import { randomUUID } from "crypto"
 import { AIMessage, HumanMessage } from "@langchain/core/messages"
 import { Command, GraphRecursionError } from "@langchain/langgraph"
-import { graph, checkpointer, isRateLimited } from "../graph/graph.js"
+import { graph, checkpointer, describeImage, isRateLimited } from "../graph/graph.js"
+import { Image } from "../models/image.model.js"
+import { embedImageText, findRelatedImages } from "../utils/imageRag.js"
 
 // A chat turn is one "run" of the graph. It pauses at every tool call: the reply
 // carries the calls to the browser, which runs them and posts the results to
@@ -16,6 +18,8 @@ const MAX_HISTORY = 12
 const MAX_TOOL_ROUNDS = 40
 const MAX_ATTACHMENTS = 5
 const MAX_ATTACHMENT_CHARS = 64 * 1024
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"])
 // A browser that closes mid-run never resumes, so its paused run is dropped after this
 const RUN_TTL_MS = 30 * 60 * 1000
 
@@ -111,27 +115,134 @@ const step = async (res, threadId, input) => {
 
 export const chat = async (req, res) => {
   try {
-    const { projectId, message, history = [], attachments = [], context } = req.body
+    const { projectId, message, history = [], attachments = [], imageIds = [], context } = req.body || {}
     const userId = req.headers["x-user-id"]
 
     if (!userId) {
       return res.status(401).json({ message: "Unauthorized" })
     }
-    if (!projectId) {
+    if (typeof projectId !== "string" || !projectId.trim()) {
       return res.status(400).json({ message: "projectId is required" })
     }
-    const content = withAttachments(typeof message === "string" ? message.trim() : "", attachments)
-    if (!content) {
+    const normalizedProjectId = projectId.trim()
+    if (!Array.isArray(attachments)) {
+      return res.status(400).json({ message: "attachments must be an array" })
+    }
+    if (!Array.isArray(imageIds) || imageIds.some((id) => typeof id !== "string")) {
+      return res.status(400).json({ message: "imageIds must be an array of image IDs" })
+    }
+    const text = typeof message === "string" ? message.trim() : ""
+    if (!text && !attachments.length && !imageIds.length) {
       return res.status(400).json({ message: "message is required" })
     }
 
+    const uniqueImageIds = [...new Set(imageIds)]
+    const currentImages = uniqueImageIds.length
+      ? await Image.find({ imageId: { $in: uniqueImageIds }, userId: String(userId), projectId: normalizedProjectId })
+        .select("imageId name caption")
+        .lean()
+      : []
+    if (currentImages.length !== uniqueImageIds.length) {
+      return res.status(404).json({ message: "One or more attached images were not found. Please attach them again." })
+    }
+    const currentById = new Map(currentImages.map((image) => [image.imageId, image]))
+    const orderedImages = uniqueImageIds.map((id) => currentById.get(id))
+    const imageQuery = [text, ...orderedImages.map((image) => image.caption)].filter(Boolean).join("\n")
+    let relatedImages
+    try {
+      relatedImages = await findRelatedImages({
+        userId: String(userId),
+        projectId: normalizedProjectId,
+        query: imageQuery,
+        excludeImageIds: uniqueImageIds,
+      })
+    } catch (error) {
+      console.error("Image retrieval error:", error)
+      return res.status(502).json({ message: "AmeekAi could not search your saved images. Please try again." })
+    }
+
+    const imageContext = [
+      orderedImages.length && `Images attached to this message:\n${orderedImages.map((image) => `- "${image.name}": ${image.caption}`).join("\n")}`,
+      relatedImages.length && `Related images retrieved from this project's image library:\n${relatedImages.map((image) => `- "${image.name}": ${image.caption}`).join("\n")}`,
+    ].filter(Boolean).join("\n\n")
+    const content = [withAttachments(text, attachments), imageContext].filter(Boolean).join("\n\n")
+
     const threadId = randomUUID()
-    runs.set(threadId, { userId: String(userId), projectId: String(projectId), context: cleanContext(context), updatedAt: Date.now() })
+    runs.set(threadId, { userId: String(userId), projectId: normalizedProjectId, context: cleanContext(context), updatedAt: Date.now() })
 
     return step(res, threadId, { messages: [...buildHistory(history), new HumanMessage(content)] })
   } catch (error) {
     console.error("AI chat error:", error)
     return res.status(500).json({ message: "AI chat error" })
+  }
+}
+
+export const uploadImage = async (req, res) => {
+  const userId = req.headers["x-user-id"]
+  if (!userId) return res.status(401).json({ message: "Unauthorized" })
+
+  const { projectId, name, mimeType, data } = req.body || {}
+  if (typeof projectId !== "string" || !projectId.trim()) {
+    return res.status(400).json({ message: "projectId is required" })
+  }
+  if (typeof name !== "string" || !name.trim() || name.length > 255) {
+    return res.status(400).json({ message: "A valid image name is required" })
+  }
+  if (!IMAGE_TYPES.has(mimeType)) {
+    return res.status(415).json({ message: "Use a JPEG, PNG, WebP, or GIF image" })
+  }
+  if (typeof data !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) {
+    return res.status(400).json({ message: "Image data must be base64 encoded" })
+  }
+
+  const bytes = Buffer.from(data, "base64")
+  if (!bytes.length || bytes.length > MAX_IMAGE_BYTES || bytes.toString("base64") !== data) {
+    return res.status(413).json({ message: "Each image must be no larger than 8 MB" })
+  }
+
+  try {
+    const caption = await describeImage(mimeType, data)
+    const embedding = await embedImageText(caption, "RETRIEVAL_DOCUMENT")
+    const imageId = randomUUID()
+    await Image.create({
+      imageId,
+      userId: String(userId),
+      projectId: projectId.trim(),
+      name: name.trim(),
+      mimeType,
+      data: bytes,
+      caption,
+      embedding,
+    })
+    return res.status(201).json({ imageId, caption })
+  } catch (error) {
+    console.error("Image indexing error:", error)
+    if (isRateLimited(error)) {
+      return res.status(429).json({ message: "AmeekAi is temporarily out of image-processing quota. Try again later." })
+    }
+    return res.status(502).json({ message: "AmeekAi could not process this image. Check the AI service and try again." })
+  }
+}
+
+export const getImage = async (req, res) => {
+  const userId = req.headers["x-user-id"]
+  if (!userId) return res.status(401).json({ message: "Unauthorized" })
+
+  try {
+    const image = await Image.findOne({
+      imageId: req.params.imageId,
+      userId: String(userId),
+    }).select("+data")
+    if (!image) return res.status(404).json({ message: "Image not found" })
+
+    return res
+      .status(200)
+      .type(image.mimeType)
+      .set("Cache-Control", "private, max-age=3600")
+      .send(image.data)
+  } catch (error) {
+    console.error("Image retrieval error:", error)
+    return res.status(500).json({ message: "Could not retrieve this image" })
   }
 }
 

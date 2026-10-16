@@ -20,7 +20,7 @@ app.use(morgan("dev"))
 app.use("/api/auth",proxy(process.env.AUTH_SERVICE))
 app.use("/api/projects",protect,proxyWithHeader(process.env.PROJECT_SERVICE))
 app.use("/api/files",protect,proxyWithHeader(process.env.FILES_SERVICE))
-app.use("/api/ai",protect,proxyWithHeader(process.env.AI_SERVICE))
+app.use("/api/ai",protect,proxyWithHeader(process.env.AI_SERVICE, "12mb"))
 app.get("/api/me",protect,getCurrentUser)
 app.get("/",(req,res)=>{
    res.json({"message":"Hello from gateway!"})
