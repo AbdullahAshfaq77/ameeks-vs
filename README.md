@@ -2,7 +2,7 @@
 
 ### A Modern Developer Workspace
 
-**AMEEK-VS** is a developer-focused software project designed around the idea of bringing essential development capabilities together in one organized environment.
+**AMEEK-VS** is  developer-focused software project designed around the idea of bringing essential development capabilities together in one organized environment.
 
 The project follows a modular architecture, with separate frontend and backend components, providing a foundation for building an integrated developer experience.
 
